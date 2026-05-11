@@ -1,0 +1,23 @@
+# Build outputs
+build/
+.gradle/
+*.apk
+*.aab
+*.idsig
+
+# Local config
+local.properties
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.cxx/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Kotlin/Gradle caches
+.kotlin/
+captures/
