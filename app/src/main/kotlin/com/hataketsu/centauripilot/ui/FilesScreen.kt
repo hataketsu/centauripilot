@@ -15,8 +15,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.hataketsu.centauripilot.AppViewModel
-import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonObject
+import kotlinx.coroutines.delay
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
@@ -32,6 +31,9 @@ fun FilesScreen(vm: AppViewModel) {
     val log by vm.wireLog.items.collectAsState()
     var currentDir by remember { mutableStateOf("/local") }
     var selected by remember { mutableStateOf<String?>(null) }
+    var refreshTick by remember { mutableStateOf(0) }
+    var confirmDelete by remember { mutableStateOf<String?>(null) }
+    var toast by remember { mutableStateOf<String?>(null) }
 
     // Parse latest GET_PRINTER_FILE_LIST response from wire log
     val files: List<RemoteFile> = remember(log) {
@@ -39,9 +41,7 @@ fun FilesScreen(vm: AppViewModel) {
             it.text.contains("sdcp/response") && it.text.contains("\"Cmd\":258")
         } ?: return@remember emptyList<RemoteFile>()
         try {
-            val raw = last.text
-            // crude: find FileList array in JSON
-            val obj = kotlinx.serialization.json.Json.parseToJsonElement(raw).jsonObject
+            val obj = kotlinx.serialization.json.Json.parseToJsonElement(last.text).jsonObject
             val data = obj["Data"]?.jsonObject?.get("Data")?.jsonObject
             val list = data?.get("FileList")?.jsonArray ?: return@remember emptyList()
             list.mapNotNull { e ->
@@ -54,16 +54,36 @@ fun FilesScreen(vm: AppViewModel) {
                     ?: o["FileSize"]?.jsonPrimitive?.longOrNullSafe()
                 RemoteFile(name, size, isDir = (type == 0))
             }
-        } catch (e: Exception) { emptyList() }
+        } catch (_: Exception) { emptyList() }
     }
 
-    LaunchedEffect(currentDir, client) { client?.fetchFileList(currentDir) }
+    // Auto-detect successful delete (Cmd 259, Ack=0) → re-fetch list automatically
+    val lastDeleteResp = remember(log) {
+        log.lastOrNull { it.text.contains("sdcp/response") && it.text.contains("\"Cmd\":259") }
+    }
+    LaunchedEffect(lastDeleteResp?.ts) {
+        val resp = lastDeleteResp ?: return@LaunchedEffect
+        // Look for Ack:0 in payload
+        if (resp.text.contains("\"Ack\":0")) {
+            delay(300)
+            client?.fetchFileList(currentDir)
+            toast = "Đã xóa"
+        } else if (resp.text.contains("\"Ack\":")) {
+            toast = "Xóa lỗi (Ack ≠ 0)"
+        }
+    }
+
+    LaunchedEffect(currentDir, client, refreshTick) { client?.fetchFileList(currentDir) }
+    LaunchedEffect(toast) { if (toast != null) { delay(2000); toast = null } }
+
+    fun pathOf(name: String): String =
+        "${currentDir.removePrefix("/local")}/$name".replace("//", "/").ifEmpty { "/$name" }
 
     Column(Modifier.fillMaxSize().padding(12.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(currentDir, color = Color.White, fontWeight = FontWeight.SemiBold,
                 fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f))
-            IconButton(onClick = { client?.fetchFileList(currentDir) }) {
+            IconButton(onClick = { refreshTick++ }) {
                 Icon(Icons.Default.Refresh, null, tint = Color.White)
             }
             if (currentDir != "/local") {
@@ -72,7 +92,7 @@ fun FilesScreen(vm: AppViewModel) {
                 }
             }
         }
-        Divider(color = Color(0xFF223247))
+        HorizontalDivider(color = Color(0xFF223247))
         if (files.isEmpty()) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text("Trống / chưa nhận file list. Bấm Refresh.",
@@ -97,7 +117,6 @@ fun FilesScreen(vm: AppViewModel) {
                         trailingContent = if (isSel) {{ Icon(Icons.Default.Check, null, tint = Color(0xFF4CAF50)) }} else null,
                         colors = ListItemDefaults.colors(containerColor = if (isSel) Color(0xFF1B2A3E) else Color(0xFF14202F)),
                         modifier = Modifier.padding(vertical = 2.dp)
-                            .also { /* clickable via Surface below */ }
                     )
                     Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp),
                         horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -106,13 +125,13 @@ fun FilesScreen(vm: AppViewModel) {
                                 Text("Mở")
                             }
                         } else {
-                            TextButton(onClick = { selected = f.name; client?.fetchFileDetail("${currentDir.removePrefix("/local")}/${f.name}".replace("//","/")) }) {
+                            TextButton(onClick = { selected = f.name; client?.fetchFileDetail(pathOf(f.name)) }) {
                                 Text("Chọn")
                             }
-                            TextButton(onClick = {
-                                client?.startPrint("${currentDir.removePrefix("/local")}/${f.name}".replace("//","/"))
-                            }) { Text("In", color = Color(0xFFF2C037)) }
-                            TextButton(onClick = { client?.deleteFiles(listOf("${currentDir.removePrefix("/local")}/${f.name}".replace("//","/"))) }) {
+                            TextButton(onClick = { client?.startPrint(pathOf(f.name)) }) {
+                                Text("In", color = Color(0xFFF2C037))
+                            }
+                            TextButton(onClick = { confirmDelete = f.name }) {
                                 Text("Xóa", color = Color(0xFFFF6B6B))
                             }
                         }
@@ -120,6 +139,33 @@ fun FilesScreen(vm: AppViewModel) {
                 }
             }
         }
+        // Snackbar-like toast
+        toast?.let {
+            Surface(color = Color(0xFF1B2A3E),
+                modifier = Modifier.fillMaxWidth().padding(8.dp)) {
+                Text(it, color = Color.White, modifier = Modifier.padding(12.dp), fontSize = 13.sp)
+            }
+        }
+    }
+
+    // Confirm delete dialog
+    confirmDelete?.let { name ->
+        AlertDialog(
+            onDismissRequest = { confirmDelete = null },
+            containerColor = Color(0xFF14202F),
+            title = { Text("Xóa file?", color = Color.White) },
+            text = { Text(name, color = Color(0xFF8FA1B8), fontSize = 13.sp) },
+            confirmButton = {
+                TextButton(onClick = {
+                    client?.deleteFiles(listOf(pathOf(name)))
+                    confirmDelete = null
+                    toast = "Đang xóa…"
+                }) { Text("Xóa", color = Color(0xFFFF6B6B)) }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDelete = null }) { Text("Hủy") }
+            }
+        )
     }
 }
 
